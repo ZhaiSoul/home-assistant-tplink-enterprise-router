@@ -4,6 +4,7 @@ DEFAULT_NAME = "TP Link Enterprise Router"
 DEFAULT_HOST = "http://192.168.0.1"
 DEFAULT_INSTANCE_NAME = "TP Link Enterprise Router"
 PLATFORMS = ["sensor", "button", "switch", "device_tracker"]
+DEFAULT_TRACKED_DEVICES = ""  # 空字符串表示追踪所有设备
 MIN_SEVERITY_LEVELS = {
     "emerg": 0,
     "alert": 1,

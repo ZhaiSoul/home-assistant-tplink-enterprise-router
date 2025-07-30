@@ -17,7 +17,8 @@
           "enable_dedicated_event": "Fire Dedicated Event",
           "enable_host_entity": "Create Host Entities",
           "unstable_check_count": "Unstable Client Check Count",
-          "unstable_check_time": "Unstable Client Check Time"
+          "unstable_check_time": "Unstable Client Check Time",
+          "tracked_devices": "Need to tracked devices"
         }
       }
     }

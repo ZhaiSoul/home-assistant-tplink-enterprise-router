@@ -16,9 +16,10 @@
           "unique_id": "Unique ID (多个路由请勿重复)",
           "enable_universal_event": "使用合并事件",
           "enable_dedicated_event": "使用独立事件",
-          "enable_host_entity": "创建客户端实体",
+          "enable_host_entity": "创建客户端设备",
           "unstable_check_count": "不稳定客户端检测次数",
-          "unstable_check_time": "不稳定客户端检测时间"
+          "unstable_check_time": "不稳定客户端检测时间",
+          "tracked_devices": "需要追踪的设备"
         }
       }
     }

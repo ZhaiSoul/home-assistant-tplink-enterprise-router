@@ -5,6 +5,9 @@ from homeassistant.components.device_tracker import ScannerEntity, SourceType
 from homeassistant.components.device_tracker.config_entry import BaseTrackerEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import translation
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.storage import Store
@@ -87,6 +90,17 @@ class DeviceTracker:
         self.async_add_entities(entities, False)
 
     async def update_hosts(self, host_dict: dict) -> None:
+        # Get the tracked_devices setting from config options
+        tracked_devices_str = self.entry.options.get("tracked_devices", "")
+        
+        # Filter host_dict if tracked_devices is specified
+        if tracked_devices_str:
+            # Parse the comma-separated MAC addresses
+            tracked_macs = [mac.strip().lower() for mac in tracked_devices_str.split(",")]
+            # Filter the host_dict to only include tracked devices
+            host_dict = {mac: device for mac, device in host_dict.items() 
+                        if mac.lower() in tracked_macs}
+        
         new_mac_list = list(host_dict.keys())
         added = list(set(new_mac_list) - set(self.mac_list))
         removed = list(set(self.mac_list) - set(new_mac_list))
@@ -130,11 +144,30 @@ class TPLinkTracker(CoordinatorEntity, BaseTrackerEntity):
         self.mac = mac
         self.device = coordinator.status['hosts_dict'].get(mac, {})
         entry_key = coordinator.entry.entry_id
-        self._attr_device_info = coordinator.device_info
+        self.hass = coordinator.hass
+        
+        # Create a unique ID for the entity
         self._attr_unique_id = f"{DOMAIN}_host_{mac}_{entry_key}"
         self.entity_id = f"device_tracker.{DOMAIN}_host_{mac}_{entry_key}"
+        
+        # Define device info for the client device (not the router)
+        self._attr_device_info = {
+            "identifiers": {
+                # Set MAC address as the primary identifier
+                (DOMAIN, mac),
+                # Add additional identifier that Nmap integration uses
+                ("nmap_tracker", mac)
+            },
+            "name": self._get_device_name(),
+            "manufacturer": self.device.get("manufacturer", "Unknown"),
+            "model": self.device.get("model", "Network Client"),
+            "via_device": (DOMAIN, coordinator.entry.entry_id),  # Link to the router
+        }
 
         super().__init__(coordinator)
+        
+        # Register or update the device after initialization
+        self._register_device()
 
     @property
     def is_connected(self) -> bool:
@@ -150,12 +183,130 @@ class TPLinkTracker(CoordinatorEntity, BaseTrackerEntity):
         """Return the source type of the client."""
         return SourceType.ROUTER
 
+    def _get_device_name(self) -> str:
+        """Get the name of the device."""
+        # First try to get the hostname
+        hostname = self.device.get("hostname") if self.device else None
+        
+        # Check if hostname is valid
+        if hostname and hostname != '' and hostname != "anonymous" and hostname != "---":
+            return hostname
+        
+        # If hostname is not valid, try to get the name from the device
+        name = self.device.get("name") if self.device else None
+        if name and name != '' and name != "anonymous" and name != "---":
+            return name
+            
+        # If name is not valid, use MAC address
+        if self.mac:
+            return self.mac
+            
+        # Last resort - use a generic name
+        return "Network Device"
+            
+    def _register_device(self) -> None:
+        """Register the device and update its area if needed."""
+        device_registry = dr.async_get(self.hass)
+        
+        # Check if device already exists
+        existing_device = device_registry.async_get_device({(DOMAIN, self.mac)})
+        
+        # Prepare device info
+        device_info = {
+            "config_entry_id": self.coordinator.entry.entry_id,
+            "identifiers": {(DOMAIN, self.mac)},
+            "name": self._get_device_name(),
+            "via_device": (DOMAIN, self.coordinator.entry.entry_id),
+        }
+        
+        # Only set manufacturer and model if they don't already exist or if we have new info
+        if not existing_device or not existing_device.manufacturer:
+            device_info["manufacturer"] = self.device.get("manufacturer", "Unknown")
+        
+        if not existing_device or not existing_device.model:
+            device_info["model"] = self.device.get("model", "Network Client")
+        
+        # Register or update the device
+        device = device_registry.async_get_or_create(**device_info)
+        _LOGGER.info("Registered device %s with ID: %s", self.mac, device.id)
+        
+        # Try to find matching Nmap device by MAC address
+        nmap_devices = [
+            d for d in device_registry.devices.values()
+            if any(ident[0] == "nmap_tracker" and ident[1] == self.mac 
+                  for ident in d.identifiers)
+        ]
+        
+        if nmap_devices:
+            nmap_device = nmap_devices[0]
+            _LOGGER.info(
+                "Found matching Nmap device for %s: %s (area_id: %s)", 
+                self.mac, 
+                nmap_device.id, 
+                nmap_device.area_id
+            )
+            
+            # If Nmap device has an area assigned, use that area for our device
+            if nmap_device.area_id:
+                device_registry.async_update_device(
+                    device.id, 
+                    area_id=nmap_device.area_id
+                )
+                _LOGGER.info(
+                    "Updated device %s area to match Nmap device area: %s", 
+                    self.mac, 
+                    nmap_device.area_id
+                )
+            else:
+                _LOGGER.info("Nmap device %s has no area assigned", nmap_device.id)
+                
+                # Try to get area from entity registry
+                entity_registry = er.async_get(self.hass)
+                nmap_entities = [
+                    e for e in entity_registry.entities.values()
+                    if e.device_id == nmap_device.id and e.area_id
+                ]
+                
+                if nmap_entities:
+                    area_id = nmap_entities[0].area_id
+                    _LOGGER.info(
+                        "Found area %s from Nmap entity %s", 
+                        area_id, 
+                        nmap_entities[0].entity_id
+                    )
+                    device_registry.async_update_device(
+                        device.id, 
+                        area_id=area_id
+                    )
+        else:
+            _LOGGER.info("No matching Nmap device found for %s", self.mac)
+            
+            # Try to get area from entity registry directly
+            entity_registry = er.async_get(self.hass)
+            nmap_entities = [
+                e for e in entity_registry.entities.values()
+                if e.unique_id == self.mac and e.platform == "nmap_tracker" and e.area_id
+            ]
+            
+            if nmap_entities:
+                area_id = nmap_entities[0].area_id
+                _LOGGER.info(
+                    "Found area %s from Nmap entity with MAC %s", 
+                    area_id, 
+                    self.mac
+                )
+                device_registry.async_update_device(
+                    device.id, 
+                    area_id=area_id
+                )
+        
+        # Store device ID for later use
+        self.device_id = device.id
+            
     @property
     def name(self) -> str:
         """Return the name of the client."""
-        hostname = self.device.get("hostname")
-        return hostname if (hostname != '' and hostname != "anonymous" and hostname != "---") else self.device.get(
-            "mac")
+        return self._get_device_name()
 
     @property
     def hostname(self) -> str:
@@ -211,4 +362,114 @@ class TPLinkTracker(CoordinatorEntity, BaseTrackerEntity):
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         self.device = self.coordinator.status['hosts_dict'].get(self.mac, {})
+        
+        # Update device name if it has changed
+        device_registry = dr.async_get(self.hass)
+        if hasattr(self, 'device_id'):
+            device = device_registry.async_get_device({(DOMAIN, self.mac)})
+            new_name = self._get_device_name()
+            if device and device.name != new_name:
+                _LOGGER.info(
+                    "Updating device %s name from '%s' to '%s'", 
+                    self.mac, 
+                    device.name, 
+                    new_name
+                )
+                device_registry.async_update_device(
+                    self.device_id,
+                    name=new_name
+                )
+        
+        # Check for Nmap device area changes and sync if needed
+        self._sync_with_nmap_device()
+        
         self.async_write_ha_state()
+        
+    def _sync_with_nmap_device(self) -> None:
+        """Sync area with Nmap device if it exists."""
+        if not hasattr(self, 'device_id'):
+            _LOGGER.warning("Device ID not set for %s, cannot sync area", self.mac)
+            return
+            
+        device_registry = dr.async_get(self.hass)
+        
+        # Get our device
+        our_device = device_registry.async_get_device({(DOMAIN, self.mac)})
+        if not our_device:
+            _LOGGER.warning("Could not find our device for %s", self.mac)
+            return
+            
+        _LOGGER.info(
+            "Syncing area for device %s (current area: %s)", 
+            self.mac, 
+            our_device.area_id
+        )
+            
+        # Find matching Nmap device
+        nmap_devices = [
+            d for d in device_registry.devices.values()
+            if any(ident[0] == "nmap_tracker" and ident[1] == self.mac 
+                  for ident in d.identifiers)
+        ]
+        
+        area_id_to_set = None
+        
+        if nmap_devices:
+            nmap_device = nmap_devices[0]
+            _LOGGER.info(
+                "Found matching Nmap device for %s: %s (area_id: %s)", 
+                self.mac, 
+                nmap_device.id, 
+                nmap_device.area_id
+            )
+            
+            # If Nmap device has an area assigned, use that area for our device
+            if nmap_device.area_id:
+                area_id_to_set = nmap_device.area_id
+            else:
+                _LOGGER.info("Nmap device %s has no area assigned", nmap_device.id)
+                
+                # Try to get area from entity registry
+                entity_registry = er.async_get(self.hass)
+                nmap_entities = [
+                    e for e in entity_registry.entities.values()
+                    if e.device_id == nmap_device.id and e.area_id
+                ]
+                
+                if nmap_entities:
+                    area_id_to_set = nmap_entities[0].area_id
+                    _LOGGER.info(
+                        "Found area %s from Nmap entity %s", 
+                        area_id_to_set, 
+                        nmap_entities[0].entity_id
+                    )
+        else:
+            _LOGGER.info("No matching Nmap device found for %s", self.mac)
+            
+            # Try to get area from entity registry directly
+            entity_registry = er.async_get(self.hass)
+            nmap_entities = [
+                e for e in entity_registry.entities.values()
+                if e.unique_id == self.mac and e.platform == "nmap_tracker" and e.area_id
+            ]
+            
+            if nmap_entities:
+                area_id_to_set = nmap_entities[0].area_id
+                _LOGGER.info(
+                    "Found area %s from Nmap entity with MAC %s", 
+                    area_id_to_set, 
+                    self.mac
+                )
+        
+        # Update device area if needed
+        if area_id_to_set and area_id_to_set != our_device.area_id:
+            _LOGGER.info(
+                "Updating device %s area from %s to %s", 
+                self.mac, 
+                our_device.area_id, 
+                area_id_to_set
+            )
+            device_registry.async_update_device(
+                our_device.id, 
+                area_id=area_id_to_set
+            )
